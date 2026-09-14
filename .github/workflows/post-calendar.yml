@@ -1,0 +1,28 @@
+name: Post Finviz Economic Calendar to Discord
+
+on:
+  schedule:
+    # Runs 07:00 UTC, Monday-Friday. GitHub Actions cron is ALWAYS UTC —
+    # adjust the hour for your local timezone (see notes in chat).
+    - cron: "0 7 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+jobs:
+  post-calendar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install finvizfinance requests
+
+      - name: Run script
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python finviz_econ_calendar_to_discord.py
