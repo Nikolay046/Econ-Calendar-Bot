@@ -20,9 +20,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install finvizfinance requests
+        run: pip install finvizfinance requests python-dateutil
 
       - name: Run script
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEBUG: ${{ vars.DEBUG }}
         run: python finviz_econ_calendar_to_discord.py
