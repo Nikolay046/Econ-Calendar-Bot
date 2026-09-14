@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs 07:00 UTC, Monday-Friday. GitHub Actions cron is ALWAYS UTC —
     # adjust the hour for your local timezone (see notes in chat).
-    - cron: "0 5 * * 1-5"
+    - cron: "0 7 * * 1-5"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install finvizfinance requests python-dateutil
+        run: pip install finvizfinance requests python-dateutil beautifulsoup4
 
       - name: Run script
         env:
