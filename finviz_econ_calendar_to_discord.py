@@ -54,6 +54,42 @@ def debug_print(*args):
         print(*args, file=sys.stderr)
 
 
+def inspect_raw_page():
+    """DEBUG-only diagnostic: fetch Finviz's calendar page ourselves, with
+    requests + BeautifulSoup, completely bypassing the finvizfinance library.
+    This tells us whether the library's assumptions about the page's HTML
+    are still correct, or whether Finviz has changed something structurally
+    (e.g. moved to client-side JS rendering, renamed classes, etc.)."""
+    from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+    }
+    debug_print("==== RAW PAGE INSPECTION (bypassing finvizfinance) ====")
+    try:
+        resp = requests.get("https://finviz.com/calendar.ashx", headers=headers, timeout=15)
+        debug_print(f"status={resp.status_code}  content_length={len(resp.text)}")
+    except requests.RequestException as e:
+        debug_print(f"RAW PAGE FETCH FAILED: {e}")
+        return
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    tables = soup.find_all("table")
+    debug_print(f"found {len(tables)} <table> elements total")
+    for i, t in enumerate(tables[:3]):
+        debug_print(f"--- table[{i}] class={t.get('class')} id={t.get('id')} ---")
+        debug_print(str(t)[:1500])
+
+    cal_els = soup.select("[class*=calendar], [id*=calendar]")
+    debug_print(f"found {len(cal_els)} elements with 'calendar' in class/id (showing up to 5)")
+    for el in cal_els[:5]:
+        debug_print(f"  tag={el.name} class={el.get('class')} id={el.get('id')}")
+    debug_print("==== END RAW PAGE INSPECTION ====")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Post the Finviz economic calendar to Discord")
     p.add_argument("--date", default=None, help="YYYY-MM-DD, defaults to today")
@@ -178,6 +214,9 @@ def main():
         datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
     )
     impacts = {i.strip().lower() for i in args.impact.split(",") if i.strip()}
+
+    if DEBUG:
+        inspect_raw_page()
 
     df = fetch_calendar_df()
     df = filter_by_date(df, target_date)
