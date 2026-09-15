@@ -20,7 +20,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install finvizfinance requests python-dateutil beautifulsoup4
+        run: |
+          pip install playwright requests python-dateutil beautifulsoup4
+          playwright install --with-deps chromium
 
       - name: Run script
         env:
