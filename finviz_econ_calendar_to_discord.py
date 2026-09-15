@@ -2,8 +2,14 @@
 """
 Post Finviz's economic calendar to a Discord channel via a webhook.
 
+Finviz's calendar page renders its table with client-side JavaScript, so a
+plain HTTP scrape (requests / finvizfinance) cannot see the real data — the
+server sends back an empty shell. This script uses Playwright to drive a
+real headless browser, load the page properly, and read the rendered table.
+
 Setup:
-    pip install finvizfinance requests python-dateutil
+    pip install playwright requests python-dateutil beautifulsoup4
+    playwright install --with-deps chromium
 
 Usage:
     export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxx/yyyy"
@@ -18,30 +24,24 @@ Optional flags:
                                  the DISCORD_WEBHOOK_URL environment variable
 
 Debugging:
-    Set DEBUG=1 as an environment variable to print the raw scraped rows
-    (day/time/impact/release) to stderr, so you can see exactly what Finviz
-    returned if something looks wrong.
+    Set DEBUG=1 as an environment variable to print the rendered page's
+    table count and a sample of the parsed rows to stderr.
 
-Note: Finviz's calendar page only exposes the CURRENT live calendar window
-(roughly the current week) — there's no way to pull an arbitrary past/future
-date on demand. --date filters within whatever is currently being shown; if
-you ask for a date outside that window you'll get an empty result.
-
-Fail-safe design: if the day-header text from Finviz can't be confidently
-parsed as a date at all (e.g. the site's HTML format changes), this script
-does NOT silently report "no events" — it falls back to showing the whole
-unfiltered window instead, so a parsing hiccup can never look identical to
-a genuinely quiet day.
+Fail-safe design: if the day-header text can't be confidently parsed as a
+date, this script does NOT silently report "no events" — it falls back to
+showing the whole unfiltered window instead, so a parsing hiccup can never
+look identical to a genuinely quiet day.
 """
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime, date
 
 import requests
+from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
-from finvizfinance.calendar import Calendar
 
 IMPACT_EMOJI = {"low": "🟢", "medium": "🟡", "high": "🔴"}
 KNOWN_IMPACTS = {"low", "medium", "high"}
@@ -54,42 +54,6 @@ def debug_print(*args):
         print(*args, file=sys.stderr)
 
 
-def inspect_raw_page():
-    """DEBUG-only diagnostic: fetch Finviz's calendar page ourselves, with
-    requests + BeautifulSoup, completely bypassing the finvizfinance library.
-    This tells us whether the library's assumptions about the page's HTML
-    are still correct, or whether Finviz has changed something structurally
-    (e.g. moved to client-side JS rendering, renamed classes, etc.)."""
-    from bs4 import BeautifulSoup
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        )
-    }
-    debug_print("==== RAW PAGE INSPECTION (bypassing finvizfinance) ====")
-    try:
-        resp = requests.get("https://finviz.com/calendar.ashx", headers=headers, timeout=15)
-        debug_print(f"status={resp.status_code}  content_length={len(resp.text)}")
-    except requests.RequestException as e:
-        debug_print(f"RAW PAGE FETCH FAILED: {e}")
-        return
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    tables = soup.find_all("table")
-    debug_print(f"found {len(tables)} <table> elements total")
-    for i, t in enumerate(tables[:3]):
-        debug_print(f"--- table[{i}] class={t.get('class')} id={t.get('id')} ---")
-        debug_print(str(t)[:1500])
-
-    cal_els = soup.select("[class*=calendar], [id*=calendar]")
-    debug_print(f"found {len(cal_els)} elements with 'calendar' in class/id (showing up to 5)")
-    for el in cal_els[:5]:
-        debug_print(f"  tag={el.name} class={el.get('class')} id={el.get('id')}")
-    debug_print("==== END RAW PAGE INSPECTION ====")
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="Post the Finviz economic calendar to Discord")
     p.add_argument("--date", default=None, help="YYYY-MM-DD, defaults to today")
@@ -100,34 +64,86 @@ def parse_args():
     return p.parse_args()
 
 
-def fetch_calendar_df():
-    """Pull the live calendar table from Finviz as a DataFrame."""
-    cal = Calendar()
-    df = cal.calendar()
-    if df.empty:
-        return df
-    # "Datetime" looks like "Monday Sep 14, 08:30AM" -> split into day / time
-    split = df["Datetime"].str.split(",", n=1, expand=True)
-    df["day_str"] = split[0].str.strip()
-    df["time_str"] = split[1].str.strip() if split.shape[1] > 1 else ""
+def fetch_rendered_html(target_date: date) -> str:
+    """Load Finviz's calendar page in a real headless browser and return
+    the fully rendered HTML (after JavaScript has populated the table)."""
+    from playwright.sync_api import sync_playwright
 
-    if DEBUG:
-        debug_print("---- RAW CALENDAR ROWS ----")
-        for _, r in df.iterrows():
-            debug_print(f"day_str={r['day_str']!r}  time_str={r['time_str']!r}  "
-                         f"Impact={r.get('Impact')!r}  Release={r.get('Release')!r}")
-        debug_print("---------------------------")
+    url = f"https://finviz.com/calendar/economic?dateFrom={target_date.isoformat()}"
+    debug_print(f"Loading {url} in headless Chromium...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        # Give the SPA a moment to finish hydrating after network idle
+        page.wait_for_timeout(2000)
+        html = page.content()
+        browser.close()
+    return html
 
-    return df
+
+def parse_calendar_html(html: str):
+    """Parse the rendered calendar HTML into a list of event dicts."""
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    debug_print(f"Rendered page contains {len(tables)} <table> element(s)")
+
+    rows_out = []
+    for t_idx, table in enumerate(tables):
+        trs = table.find_all("tr")
+        if not trs:
+            continue
+        header_cell = trs[0].find("td")
+        if not header_cell:
+            continue
+        day_str = header_cell.get_text(strip=True)
+
+        for tr in trs[1:]:
+            cols = tr.find_all("td")
+            if len(cols) < 6:
+                continue
+            time_str = cols[0].get_text(strip=True)
+            release = cols[1].get_text(strip=True)
+
+            impact = ""
+            impact_img = cols[2].find("img") if len(cols) > 2 else None
+            if impact_img and impact_img.get("src"):
+                m = re.search(r"impact_(\w+)\.\w+", impact_img["src"])
+                if m:
+                    impact = m.group(1).lower()
+            if not impact:
+                # fall back to any class/title hint on the cell itself
+                impact = (cols[2].get("title") or "").strip().lower() if len(cols) > 2 else ""
+
+            for_field = cols[3].get_text(strip=True) if len(cols) > 3 else ""
+            actual = cols[4].get_text(strip=True) if len(cols) > 4 else ""
+            expected = cols[5].get_text(strip=True) if len(cols) > 5 else ""
+            prior = cols[6].get_text(strip=True) if len(cols) > 6 else ""
+
+            rows_out.append({
+                "day_str": day_str,
+                "time_str": time_str,
+                "Release": release,
+                "Impact": impact,
+                "For": for_field,
+                "Actual": actual,
+                "Expected": expected,
+                "Prior": prior,
+            })
+
+        if DEBUG and rows_out:
+            debug_print(f"--- table[{t_idx}] day_str={day_str!r}, "
+                        f"{len(trs) - 1} row(s) ---")
+            for r in rows_out[-min(3, len(trs) - 1):]:
+                debug_print(f"  time={r['time_str']!r} release={r['Release']!r} "
+                            f"impact={r['Impact']!r} actual={r['Actual']!r} "
+                            f"expected={r['Expected']!r} prior={r['Prior']!r}")
+
+    return rows_out
 
 
 def parse_day_string(s, year_hint):
-    """Fuzzy-parse a day-header string like 'Monday Sep 14' into a date.
-
-    Uses dateutil's fuzzy parser instead of a rigid format string, since we
-    can't be 100% sure of Finviz's exact wording/abbreviations, and a mismatch
-    there must never be mistaken for 'no events'.
-    """
+    """Fuzzy-parse a day-header string like 'Mon Sep 14' into a date."""
     try:
         parsed = date_parser.parse(s, fuzzy=True, default=datetime(year_hint, 1, 1))
         return parsed.date()
@@ -135,24 +151,21 @@ def parse_day_string(s, year_hint):
         return None
 
 
-def filter_by_date(df, target_date: date):
-    if df.empty:
-        return df
+def filter_by_date(rows, target_date: date):
+    if not rows:
+        return rows
 
-    df = df.copy()
-    df["parsed_date"] = df["day_str"].apply(lambda s: parse_day_string(s, target_date.year))
-
-    if df["parsed_date"].isna().all():
-        # Couldn't parse ANY day header — don't pretend that means "no events".
+    parsed = [(r, parse_day_string(r["day_str"], target_date.year)) for r in rows]
+    if all(d is None for _, d in parsed):
         print(
-            "WARNING: could not parse any calendar day headers; showing the "
-            "full unfiltered window instead of risking a false 'no events'. "
-            f"Sample raw values: {list(df['day_str'].unique()[:5])}",
+            "WARNING: could not parse any calendar day headers; showing all "
+            f"fetched rows instead of risking a false 'no events'. Sample: "
+            f"{[r['day_str'] for r in rows[:5]]}",
             file=sys.stderr,
         )
-        return df
+        return rows
 
-    return df[df["parsed_date"] == target_date]
+    return [r for r, d in parsed if d == target_date]
 
 
 def keep_row_by_impact(impact_value, impacts_wanted):
@@ -164,10 +177,10 @@ def keep_row_by_impact(impact_value, impacts_wanted):
     return True
 
 
-def build_embed(df, target_date):
+def build_embed(rows, target_date):
     title = f"📅 Economic Calendar — {target_date.strftime('%A, %B %d, %Y')}"
 
-    if df.empty:
+    if not rows:
         return {
             "title": title,
             "description": "No matching releases for this date.",
@@ -175,7 +188,7 @@ def build_embed(df, target_date):
         }
 
     lines = []
-    for _, row in df.sort_values("time_str").iterrows():
+    for row in sorted(rows, key=lambda r: r["time_str"]):
         impact = str(row.get("Impact", "")).strip().lower()
         emoji = IMPACT_EMOJI.get(impact, "⚪")
         actual = row["Actual"] or "—"
@@ -215,17 +228,14 @@ def main():
     )
     impacts = {i.strip().lower() for i in args.impact.split(",") if i.strip()}
 
-    if DEBUG:
-        inspect_raw_page()
+    html = fetch_rendered_html(target_date)
+    rows = parse_calendar_html(html)
+    rows = filter_by_date(rows, target_date)
+    rows = [r for r in rows if keep_row_by_impact(r["Impact"], impacts)]
 
-    df = fetch_calendar_df()
-    df = filter_by_date(df, target_date)
-    if not df.empty:
-        df = df[df["Impact"].apply(lambda v: keep_row_by_impact(v, impacts))]
-
-    embed = build_embed(df, target_date)
+    embed = build_embed(rows, target_date)
     post_to_discord(webhook_url, embed)
-    print(f"Posted {len(df)} event(s) for {target_date} to Discord.")
+    print(f"Posted {len(rows)} event(s) for {target_date} to Discord.")
 
 
 if __name__ == "__main__":
