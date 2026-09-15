@@ -87,12 +87,19 @@ def fetch_rendered_html(target_date: date) -> str:
         # (DOM parsed, then the actual table) instead of network silence.
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         try:
-            page.wait_for_selector("table", timeout=20000)
-            debug_print("A <table> appeared in the rendered page.")
+            # A generic <table> can appear elsewhere on the page (nav, footer,
+            # pricing, etc.) before the real calendar rows finish loading.
+            # Wait for something only real event rows would contain: a
+            # time like "11:30 AM" actually rendered in the page text.
+            page.wait_for_function(
+                "() => /\\d{1,2}:\\d{2}\\s*[AP]M/.test(document.body.innerText)",
+                timeout=20000,
+            )
+            debug_print("Time-formatted event text detected in the rendered page.")
         except PlaywrightTimeoutError:
-            debug_print("No <table> appeared within 20s — capturing whatever "
-                        "HTML is present anyway so we can see why.")
-        page.wait_for_timeout(1000)  # small buffer for any trailing render
+            debug_print("No time-formatted event text appeared within 20s — "
+                        "capturing whatever HTML is present anyway so we can see why.")
+        page.wait_for_timeout(2000)  # let any trailing rows finish populating
         html = page.content()
         browser.close()
     return html
