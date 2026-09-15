@@ -67,16 +67,32 @@ def parse_args():
 def fetch_rendered_html(target_date: date) -> str:
     """Load Finviz's calendar page in a real headless browser and return
     the fully rendered HTML (after JavaScript has populated the table)."""
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
     url = f"https://finviz.com/calendar/economic?dateFrom={target_date.isoformat()}"
     debug_print(f"Loading {url} in headless Chromium...")
     with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        # Give the SPA a moment to finish hydrating after network idle
-        page.wait_for_timeout(2000)
+        browser = p.chromium.launch(
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 900},
+        )
+        # "networkidle" is unreliable on sites with live tickers/ads that
+        # never stop making background requests — wait for real content
+        # (DOM parsed, then the actual table) instead of network silence.
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.wait_for_selector("table", timeout=20000)
+            debug_print("A <table> appeared in the rendered page.")
+        except PlaywrightTimeoutError:
+            debug_print("No <table> appeared within 20s — capturing whatever "
+                        "HTML is present anyway so we can see why.")
+        page.wait_for_timeout(1000)  # small buffer for any trailing render
         html = page.content()
         browser.close()
     return html
